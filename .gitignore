@@ -1,0 +1,27 @@
+# Build / compiled output
+*.exe
+*.bin
+*.obj
+
+# Backups / scratch
+*.bak
+*.bak.*
+*.tmp
+*.log
+*.swp
+*.orig
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor / IDE
+.vscode/
+.idea/
+*.code-workspace
+.cursor/
+
+# AutoHotkey
+*.ahk.bak
