@@ -2,6 +2,22 @@
 #SingleInstance Force
 #Warn
 
+InitDpiAwareness() {
+    ; Use physical pixels on every monitor so MonitorGetWorkArea, Show(), and GetClientPos agree.
+    static done := false
+    if done
+        return
+    done := true
+    try DllCall("user32\SetProcessDpiAwarenessContext", "ptr", -4, "int") ; PER_MONITOR_AWARE_V2
+    catch {
+        try DllCall("user32\SetProcessDpiAwarenessContext", "ptr", -3, "int")
+        catch
+            try DllCall("user32\SetProcessDPIAware")
+    }
+}
+
+InitDpiAwareness()
+
 ; =============================================================================
 ; SpatialTaskbar — Alt+Space vertical task panel (AHK v2)
 ;
@@ -470,6 +486,31 @@ MonitorWorkAreaFromMouse(&l, &t, &r, &b, &w, &h) {
     MonitorGetWorkArea(1, &l, &t, &r, &b)
     w := r - l, h := b - t
     return 1
+}
+
+; Minimum outer width so the top toolbar (search + buttons) never overlaps.
+PanelMinWidth() {
+    marginX := 8, btnGap := 6, minSearch := 48
+    return 2 * marginX + 24 + btnGap + 58 + btnGap + 78 + btnGap + 78 + btnGap + 24 + minSearch
+}
+
+PositionPanelOnMonitor() {
+    global g_Gui
+    if !g_Gui
+        return
+    wl := 0, wt := 0, wr := 0, wb := 0, ww := 0, wh := 0
+    MonitorWorkAreaFromMouse(&wl, &wt, &wr, &wb, &ww, &wh)
+    pw := Min(Max(PanelMinWidth(), Floor(ww * 0.33)), ww)
+    g_Gui.Show("x" wl " y" wt " w" pw " h" wh)
+}
+
+; Second layout pass after Show — on some monitors client metrics settle one tick late.
+PostShowLayout(*) {
+    global g_PanelVisible, g_Gui
+    if !g_PanelVisible || !g_Gui
+        return
+    PositionPanelOnMonitor()
+    LayoutPanel()
 }
 
 BringToFrontNoActivate(hwnd) {
@@ -1895,16 +1936,14 @@ ShowPanel(*) {
             try g_Search.Value := ""
     }
     g_SuppressFocusHide := false
-    wl := 0, wt := 0, wr := 0, wb := 0, ww := 0, wh := 0
-    MonitorWorkAreaFromMouse(&wl, &wt, &wr, &wb, &ww, &wh)
-    pw := Max(200, Floor(ww * 0.33))
     ; Must activate the GUI (no "NA"): otherwise foreground stays elsewhere and
     ; open can mis-track focus / auto-hide.
-    ; Snap to work-area left/top (wl), full work-area height.
-    g_Gui.Show("x" wl " y" wt " w" pw " h" wh)
+    ; Snap to work-area left/top, full work-area height, ~33% width (clamped to toolbar minimum).
+    PositionPanelOnMonitor()
     ApplyGuiTitlebarTheme(g_Gui.Hwnd)
     g_PanelVisible := true
     LayoutPanel() ; client rect is valid only after Show — fixes narrow/centered content on first open
+    SetTimer(PostShowLayout, -1) ; re-measure on monitors where metrics settle after first paint
     KeepPanelTopNoActivate()
     SetTimer(HoverButtonPoll, 100)
     RefreshLists()
@@ -2043,7 +2082,7 @@ LayoutPanel() {
     marginX := 8, marginY := 6
     topGap := 4
     footerPadBottom := 6
-    footerH := 36
+    footerPadTop := 4
     btnGap := 6
     clearW := 24
     closeW := 24
@@ -2067,7 +2106,9 @@ LayoutPanel() {
     }
 
     innerW := gw - 2 * marginX
-    footerTop := gh - footerPadBottom - footerH
+    ; Reserve footer from measured button height — fixed 36 px clips on scaled monitors (150%+).
+    footerReserve := footerPadTop + botRowH + footerPadBottom
+    footerTop := gh - footerReserve
     midY := marginY + topRowH + topGap
     ; Mid-pane bottom = midY + midViewportH must stay ≤ footerTop (never overlap footer strip).
     midViewportH := Max(0, footerTop - midY)
@@ -2169,7 +2210,7 @@ LayoutPanel() {
     }
     MidPaneRefreshPaint()
 
-    btnY := footerTop + (footerH - botRowH) // 2
+    btnY := gh - footerPadBottom - botRowH
     xb := marginX
     for nm in ["BtnStart", "BtnExplorer", "BtnDownloads", "BtnDesktop"] {
         b := g_Gui[nm]
