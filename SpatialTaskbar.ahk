@@ -88,6 +88,7 @@ global WM_ACTIVATE := 0x0006
 global WM_ACTIVATEAPP := 0x001C
 global WM_VSCROLL := 0x0115
 global WM_MOUSEWHEEL := 0x020A
+global WM_DPICHANGED := 0x02E0
 global VK_LBUTTON := 0x01
 
 global g_IconList := 0
@@ -488,20 +489,76 @@ MonitorWorkAreaFromMouse(&l, &t, &r, &b, &w, &h) {
     return 1
 }
 
-; Minimum outer width so the top toolbar (search + buttons) never overlaps.
-PanelMinWidth() {
-    marginX := 8, btnGap := 6, minSearch := 48
-    return 2 * marginX + 24 + btnGap + 58 + btnGap + 78 + btnGap + 78 + btnGap + 24 + minSearch
+MonitorHandleFromIndex(monIdx) {
+    MonitorGet monIdx, &ml, &mt, &mr, &mb
+    pt := Buffer(8, 0)
+    NumPut("int", (ml + mr) // 2, pt, 0)
+    NumPut("int", (mt + mb) // 2, pt, 4)
+    return DllCall("User32\MonitorFromPoint", "int64", NumGet(pt, 0, "int64"), "uint", 2, "ptr")
 }
 
+MonitorDpiScale(monIdx) {
+    hMon := MonitorHandleFromIndex(monIdx)
+    if hMon {
+        dpiX := 0, dpiY := 0
+        if DllCall("GetModuleHandle", "str", "Shcore", "ptr") || DllCall("LoadLibrary", "str", "Shcore", "ptr") {
+            hr := DllCall("Shcore\GetDpiForMonitor", "ptr", hMon, "int", 0, "uint*", &dpiX, "uint*", &dpiY, "uint")
+            if hr = 0 && dpiX > 0
+                return dpiX / 96.0
+        }
+    }
+    try {
+        dpi := DllCall("User32\GetDpiForSystem", "uint")
+        if dpi > 0
+            return dpi / 96.0
+    }
+    return A_ScreenDPI ? A_ScreenDPI / 96.0 : 1.0
+}
+
+GuiDpiScale(hwnd) {
+    if hwnd {
+        try {
+            dpi := DllCall("User32\GetDpiForWindow", "ptr", hwnd, "uint")
+            if dpi > 0
+                return dpi / 96.0
+        }
+    }
+    try {
+        dpi := DllCall("User32\GetDpiForSystem", "uint")
+        if dpi > 0
+            return dpi / 96.0
+    }
+    return A_ScreenDPI ? A_ScreenDPI / 96.0 : 1.0
+}
+
+ScalePx(n, scale) => Max(1, Round(n * scale))
+
+; Minimum client width so the top toolbar (search + buttons) never overlaps.
+PanelMinWidth(scale := 1.0) {
+    marginX := ScalePx(8, scale), btnGap := ScalePx(6, scale), minSearch := ScalePx(48, scale)
+    return 2 * marginX + ScalePx(24, scale) + btnGap + ScalePx(58, scale) + btnGap + ScalePx(78, scale)
+        + btnGap + ScalePx(78, scale) + btnGap + ScalePx(24, scale) + minSearch
+}
+
+; Physical-pixel placement. Gui uses -DPIScale so Show() matches MonitorGetWorkArea / Win32 coords.
 PositionPanelOnMonitor() {
     global g_Gui
     if !g_Gui
         return
     wl := 0, wt := 0, wr := 0, wb := 0, ww := 0, wh := 0
-    MonitorWorkAreaFromMouse(&wl, &wt, &wr, &wb, &ww, &wh)
-    pw := Min(Max(PanelMinWidth(), Floor(ww * 0.33)), ww)
+    monIdx := MonitorWorkAreaFromMouse(&wl, &wt, &wr, &wb, &ww, &wh)
+    scale := MonitorDpiScale(monIdx)
+    pw := Min(Max(PanelMinWidth(scale), Floor(ww * 0.33)), ww)
     g_Gui.Show("x" wl " y" wt " w" pw " h" wh)
+}
+
+PanelDpiChanged(wParam, lParam, msg, hwnd, *) {
+    global g_Gui, g_PanelVisible, WM_DPICHANGED
+    if msg != WM_DPICHANGED || !g_PanelVisible || !g_Gui
+        return
+    if Integer(hwnd) != Integer(g_Gui.Hwnd)
+        return
+    SetTimer(PostShowLayout, -1)
 }
 
 ; Second layout pass after Show — on some monitors client metrics settle one tick late.
@@ -873,28 +930,58 @@ FocusMidPaneRows() {
     try DllCall("user32\SetFocus", "ptr", g_MidPane.Hwnd, "ptr")
 }
 
-FontPx(pt) {
-    dpi := A_ScreenDPI ? A_ScreenDPI : 96
+FontPx(pt, hwnd := 0) {
+    dpi := 96
+    if hwnd {
+        try {
+            d := DllCall("User32\GetDpiForWindow", "ptr", hwnd, "uint")
+            if d > 0
+                dpi := d
+        }
+    }
+    if dpi = 96 && A_ScreenDPI
+        dpi := A_ScreenDPI
     return -Round(pt * dpi / 72.0)
 }
 
-CreateUiFont(weight, pt) {
+CreateUiFont(weight, pt, hwnd := 0) {
     h := DllCall("gdi32\CreateFontW"
-        , "int", FontPx(pt), "int", 0, "int", 0, "int", 0
+        , "int", FontPx(pt, hwnd), "int", 0, "int", 0, "int", 0
         , "int", weight, "uint", 0, "uint", 0, "uint", 0, "uint", 0, "uint", 0, "uint", 5, "uint", 0, "uint", 0
         , "str", "Segoe UI Variable Text", "ptr")
     if !h
         h := DllCall("gdi32\CreateFontW"
-            , "int", FontPx(pt), "int", 0, "int", 0, "int", 0
+            , "int", FontPx(pt, hwnd), "int", 0, "int", 0, "int", 0
             , "int", weight, "uint", 0, "uint", 0, "uint", 0, "uint", 0, "uint", 0, "uint", 5, "uint", 0, "uint", 0
             , "str", "Segoe UI", "ptr")
     return h
 }
 
-MidPaneUiFont() {
-    static hFont := 0
-    if !hFont
-        hFont := CreateUiFont(400, 10.5)
+MidPaneUiFont(hwnd := 0) {
+    static hFont := 0, hFontDpi := 0
+    dpi := hwnd ? DllCall("User32\GetDpiForWindow", "ptr", hwnd, "uint") : 96
+    if !dpi
+        dpi := 96
+    if !hFont || hFontDpi != dpi {
+        if hFont
+            DllCall("gdi32\DeleteObject", "ptr", hFont)
+        hFont := CreateUiFont(400, 10.5, hwnd)
+        hFontDpi := dpi
+    }
+    return hFont
+}
+
+MidPaneHdrBoldFont(hwnd := 0) {
+    static hFont := 0, hFontDpi := 0
+    dpi := hwnd ? DllCall("User32\GetDpiForWindow", "ptr", hwnd, "uint") : 96
+    if !dpi
+        dpi := 96
+    if !hFont || hFontDpi != dpi {
+        if hFont
+            DllCall("gdi32\DeleteObject", "ptr", hFont)
+        hFont := CreateUiFont(650, 10.5, hwnd)
+        hFontDpi := dpi
+    }
     return hFont
 }
 
@@ -1519,13 +1606,6 @@ MidPaneRefreshPaint() {
     DllCall("user32\InvalidateRect", "ptr", h, "ptr", 0, "int", 0)
 }
 
-MidPaneHdrBoldFont() {
-    static hFont := 0
-    if !hFont
-        hFont := CreateUiFont(650, 10.5)
-    return hFont
-}
-
 PaintMidPaneClient(hdc, hwnd) {
     global g_RowModel, g_Sections, g_SectionHeaderClientRects, g_WindowRowClientRects, g_SelectedHwnd, g_SelectedSection, g_IconList
     global THEME_PANEL, THEME_HDR, THEME_SEL, THEME_TEXT, ICON_SIZE, LV_ROW_HEIGHT, THEME_LV_BG, THEME_LV_TEXT, MID_PANE_CHEV_W
@@ -1586,19 +1666,19 @@ PaintMidPaneClient(hdc, hwnd) {
         NumPut("int", hr.t, trChev, 4)
         NumPut("int", hr.l + MID_PANE_CHEV_W - 2, trChev, 8)
         NumPut("int", hr.b, trChev, 12)
-        oldF := DllCall("gdi32\SelectObject", "ptr", hdc, "ptr", MidPaneUiFont(), "ptr")
+        oldF := DllCall("gdi32\SelectObject", "ptr", hdc, "ptr", MidPaneUiFont(hwnd), "ptr")
         DllCall("user32\DrawTextW", "ptr", hdc, "str", chev, "int", -1, "ptr", trChev, "uint", DT_LEFT | DT_VCENTER | DT_SINGLELINE)
         trNm := Buffer(16, 0)
         NumPut("int", hr.l + MID_PANE_CHEV_W + 4, trNm, 0)
         NumPut("int", hr.t, trNm, 4)
         NumPut("int", hr.r - 4, trNm, 8)
         NumPut("int", hr.b, trNm, 12)
-        DllCall("gdi32\SelectObject", "ptr", hdc, "ptr", MidPaneHdrBoldFont(), "ptr")
+        DllCall("gdi32\SelectObject", "ptr", hdc, "ptr", MidPaneHdrBoldFont(hwnd), "ptr")
         DllCall("user32\DrawTextW", "ptr", hdc, "str", s.name, "int", -1, "ptr", trNm, "uint", DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS)
         DllCall("gdi32\SelectObject", "ptr", hdc, "ptr", oldF, "ptr")
     }
     DllCall("gdi32\SetTextColor", "ptr", hdc, "uint", ColorRefFromRgb(THEME_LV_TEXT))
-    oldRowFont := DllCall("gdi32\SelectObject", "ptr", hdc, "ptr", MidPaneUiFont(), "ptr")
+    oldRowFont := DllCall("gdi32\SelectObject", "ptr", hdc, "ptr", MidPaneUiFont(hwnd), "ptr")
     for rr in g_WindowRowClientRects {
         if rr.b < 0 || rr.t > cliH
             continue
@@ -1873,6 +1953,7 @@ EnsureMidPane() {
         g_MidPane := 0
     }
     g_MidPane := Gui("+Parent" . g_Gui.Hwnd . " -Caption")
+    g_MidPane.Opt("-DPIScale")
     g_MidPane.BackColor := THEME_PANEL
     g_MidPane.MarginX := 0, g_MidPane.MarginY := 0
     GWL_STYLE := -16
@@ -1962,16 +2043,23 @@ ToggleHotkey(*) {
 }
 
 EnsureGui() {
-    global g_Gui, g_MidPane, g_Search, g_SearchClear, g_Sections, WM_VSCROLL, WM_MOUSEWHEEL, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_ACTIVATE, WM_ACTIVATEAPP
+    global g_Gui, g_MidPane, g_Search, g_SearchClear, g_Sections, WM_VSCROLL, WM_MOUSEWHEEL, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_ACTIVATE, WM_ACTIVATEAPP, WM_DPICHANGED
     if g_Gui
         return
     if !g_Sections.Length
         InitSections()
+    try DllCall("user32\SetThreadDpiAwarenessContext", "ptr", -4, "ptr")
+    scale := GuiDpiScale(0)
+    ui := (n) => ScalePx(n, scale)
+    fontPt := Max(8, Round(10 * scale))
     ; Tool window keeps this as a lightweight panel (no taskbar button / usually not Alt+Tab).
-    g_Gui := Gui("+AlwaysOnTop +ToolWindow -Caption +Border -E0x40000", "SpatialTaskbar")
+    ; -DPIScale: use physical pixels so Show() matches MonitorGetWorkArea (critical at 125% scaling).
+    ; -Border: no non-client chrome — client area equals visible panel (no taskbar gap).
+    g_Gui := Gui("+AlwaysOnTop +ToolWindow -Caption -Border -E0x40000", "SpatialTaskbar")
+    g_Gui.Opt("-DPIScale")
     global THEME_BG, THEME_TEXT, THEME_PANEL
     g_Gui.BackColor := THEME_BG
-    g_Gui.SetFont("s10 c" THEME_TEXT, "Segoe UI")
+    g_Gui.SetFont("s" fontPt " c" THEME_TEXT, "Segoe UI")
     g_Gui.MarginX := 4, g_Gui.MarginY := 6
     GWL_STYLE := -16
     WS_CLIPCHILDREN := 0x02000000
@@ -1987,32 +2075,33 @@ EnsureGui() {
     OnMessage(WM_ACTIVATEAPP, PanelAppActivate)
     OnMessage(WM_VSCROLL, MidPaneOnVScroll)
     OnMessage(WM_MOUSEWHEEL, MidPaneOnWheel)
+    OnMessage(WM_DPICHANGED, PanelDpiChanged)
 
     EnsureMidPane()
 
-    g_Search := g_Gui.Add("Edit", "vSearchEdit xm w100 r1", "")
+    g_Search := g_Gui.Add("Edit", "vSearchEdit xm w" ui(100) " r1", "")
     g_Search.OnEvent("Change", SearchChanged)
     try g_Search.Opt("-Theme +Background" THEME_PANEL " +c" THEME_TEXT)
-    try g_Search.SetFont("s10", "Segoe UI")
+    try g_Search.SetFont("s" fontPt, "Segoe UI")
     ; Flatten search edge to remove bright Win32 bevel.
     GWL_EXSTYLE := -20
     WS_EX_CLIENTEDGE := 0x00000200
     exSearch := DllCall("user32\GetWindowLongPtr", "ptr", g_Search.Hwnd, "int", GWL_EXSTYLE, "ptr")
     DllCall("user32\SetWindowLongPtr", "ptr", g_Search.Hwnd, "int", GWL_EXSTYLE, "ptr", exSearch & ~WS_EX_CLIENTEDGE)
 
-    g_SearchClear := g_Gui.Add("Text", "vBtnSearchClear ys w24 h24 +Tabstop +0x100 +0x200 Center Border", "×")
+    g_SearchClear := g_Gui.Add("Text", "vBtnSearchClear ys w" ui(24) " h" ui(24) " +Tabstop +0x100 +0x200 Center Border", "×")
     g_SearchClear.OnEvent("Click", SearchClearClick)
 
-    g_Gui.Add("Text", "vBtnOpen ys w58 h28 +Tabstop +0x100 +0x200 Center Border", "Open").OnEvent("Click", BtnOpen)
-    g_Gui.Add("Text", "vBtnAdd ys w78 h28 +Tabstop +0x100 +0x200 Center Border", "+ Section").OnEvent("Click", BtnAddSection)
-    g_Gui.Add("Text", "vBtnDel ys w78 h28 +Tabstop +0x100 +0x200 Center Border", "- Section").OnEvent("Click", BtnDelSection)
+    g_Gui.Add("Text", "vBtnOpen ys w" ui(58) " h" ui(28) " +Tabstop +0x100 +0x200 Center Border", "Open").OnEvent("Click", BtnOpen)
+    g_Gui.Add("Text", "vBtnAdd ys w" ui(78) " h" ui(28) " +Tabstop +0x100 +0x200 Center Border", "+ Section").OnEvent("Click", BtnAddSection)
+    g_Gui.Add("Text", "vBtnDel ys w" ui(78) " h" ui(28) " +Tabstop +0x100 +0x200 Center Border", "- Section").OnEvent("Click", BtnDelSection)
 
-    g_Gui.Add("Text", "vBtnClosePanel ys w24 h24 +Tabstop +0x100 +0x200 Center Border", "×").OnEvent("Click", HidePanel)
+    g_Gui.Add("Text", "vBtnClosePanel ys w" ui(24) " h" ui(24) " +Tabstop +0x100 +0x200 Center Border", "×").OnEvent("Click", HidePanel)
 
-    g_Gui.Add("Text", "vBtnStart xm w70 h28 Hidden +Tabstop +0x100 +0x200 Center Border", "Start").OnEvent("Click", BtnStart)
-    g_Gui.Add("Text", "vBtnExplorer ys w80 h28 Hidden +Tabstop +0x100 +0x200 Center Border", "Explorer").OnEvent("Click", BtnExplorer)
-    g_Gui.Add("Text", "vBtnDownloads ys w90 h28 Hidden +Tabstop +0x100 +0x200 Center Border", "Downloads").OnEvent("Click", BtnDownloads)
-    g_Gui.Add("Text", "vBtnDesktop ys w110 h28 Hidden +Tabstop +0x100 +0x200 Center Border", "Show desktop").OnEvent("Click", BtnDesktop)
+    g_Gui.Add("Text", "vBtnStart xm w" ui(70) " h" ui(28) " Hidden +Tabstop +0x100 +0x200 Center Border", "Start").OnEvent("Click", BtnStart)
+    g_Gui.Add("Text", "vBtnExplorer ys w" ui(80) " h" ui(28) " Hidden +Tabstop +0x100 +0x200 Center Border", "Explorer").OnEvent("Click", BtnExplorer)
+    g_Gui.Add("Text", "vBtnDownloads ys w" ui(90) " h" ui(28) " Hidden +Tabstop +0x100 +0x200 Center Border", "Downloads").OnEvent("Click", BtnDownloads)
+    g_Gui.Add("Text", "vBtnDesktop ys w" ui(110) " h" ui(28) " Hidden +Tabstop +0x100 +0x200 Center Border", "Show desktop").OnEvent("Click", BtnDesktop)
 
     for nm in ["BtnSearchClear", "BtnOpen", "BtnAdd", "BtnDel", "BtnStart", "BtnExplorer", "BtnDownloads", "BtnDesktop"]
         ThemeStyleButton(g_Gui[nm])
@@ -2079,18 +2168,20 @@ LayoutPanel() {
     g_Gui.GetClientPos(, , &gw, &gh)
     if gh < 150 ; width can be 0 before first Show — still run once Show() has sized the window
         return
-    marginX := 8, marginY := 6
-    topGap := 4
-    footerPadBottom := 6
-    footerPadTop := 4
-    btnGap := 6
-    clearW := 24
-    closeW := 24
-    openW := 58
-    addW := 78
-    delW := 78
-    btnHTop := 28
-    btnHSmall := 24
+    scale := GuiDpiScale(g_Gui.Hwnd)
+    Px(n) => ScalePx(n, scale)
+    marginX := Px(8), marginY := Px(6)
+    topGap := Px(4)
+    footerPadBottom := Px(6)
+    footerPadTop := Px(4)
+    btnGap := Px(6)
+    clearW := Px(24)
+    closeW := Px(24)
+    openW := Px(58)
+    addW := Px(78)
+    delW := Px(78)
+    btnHTop := Px(28)
+    btnHSmall := Px(24)
 
     topRowH := btnHTop
     try g_Search.GetPos(, , , &sh)
