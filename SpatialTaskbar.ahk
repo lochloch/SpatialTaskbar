@@ -802,7 +802,7 @@ RefreshLists(*) {
             }
         }
         g_FilterExpandBackup := 0
-        g_LastListSig := "" ; expanded state is not in list sig — force relayout after restore
+        g_LastListSig := "" ; force relayout after filter restore (plan may match while expanded flags differ)
     } else if prevFilter = "" && g_Filter != "" {
         g_FilterExpandBackup := Map()
         for i, s in g_Sections {
@@ -843,7 +843,7 @@ RefreshLists(*) {
 
     sig := g_Filter "`n" FingerprintSortedOpen(allOpen) "`n"
     for i, s in g_Sections
-        sig .= i ":" JoinHwnds(plan.Has(i) ? plan[i] : []) "`n"
+        sig .= i ":" (s.expanded ? "1" : "0") ":" JoinHwnds(plan.Has(i) ? plan[i] : []) "`n"
     expandForced := false
     if g_Filter != "" {
         for i, s in g_Sections {
@@ -1914,7 +1914,7 @@ ToggleExpand(secIdx, *) {
     if g_Filter != "" ; while filtering, sections stay expanded so matches stay visible
         return
     g_Sections[secIdx].expanded := !g_Sections[secIdx].expanded
-    LayoutPanel()
+    RefreshLists()
 }
 
 ; Hide panel first so a Run / Send failure (AppLocker, GPO, missing shell verb, blocked
