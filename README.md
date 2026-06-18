@@ -26,7 +26,7 @@ no installer, no settings file, nothing written to disk.
 
 | Key | Action |
 | --- | --- |
-| `Alt+Space` | Show / hide / refocus the panel on the monitor under the cursor |
+| `Alt+Space` | Show / hide the panel on the monitor under the cursor |
 
 > Note: `Alt+Space` normally opens the active window's system menu in
 > Windows. This script reclaims it.

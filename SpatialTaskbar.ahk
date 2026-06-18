@@ -21,7 +21,7 @@ InitDpiAwareness()
 ; =============================================================================
 ; SpatialTaskbar — Alt+Space vertical task panel (AHK v2)
 ;
-; Alt+Space: show / hide / refocus the panel on the monitor under the cursor
+; Alt+Space: show / hide the panel on the monitor under the cursor
 ; (left edge, full work-area height, ~33% width). Panel hides when any
 ; non-panel window becomes active. Open focuses the selected window and closes
 ; the panel. Single-click / focus on a row raises that window without stealing
@@ -568,6 +568,7 @@ PostShowLayout(*) {
         return
     PositionPanelOnMonitor()
     LayoutPanel()
+    EnsureSelectedWindowVisible()
 }
 
 BringToFrontNoActivate(hwnd) {
@@ -785,7 +786,7 @@ FingerprintSortedOpen(allOpen) {
     return JoinHwnds(a)
 }
 
-RefreshLists(*) {
+RefreshLists(restoreHiddenSelection := false) {
     global g_Sections, g_Gui, g_Search, g_Filter, g_HwndToSection, g_Order
     global g_Drag, g_PanelVisible, g_LastListSig, g_SelectedHwnd, g_RebuildingGui, g_FilterExpandBackup
     if !g_Gui
@@ -870,25 +871,11 @@ RefreshLists(*) {
 
     }
     BuildRowModelFromPlan(plan)
-    ; Apply selection before LayoutPanel so one paint shows the correct highlight (no extra MidPaneInvalidate).
-    rows := VisibleWindowRows()
-    if rows.Length {
-        keepIdx := 0
-        if g_SelectedHwnd {
-            for i, r in rows
-                if Integer(r.hwnd) = Integer(g_SelectedHwnd) {
-                    keepIdx := i
-                    break
-                }
-        }
-        if keepIdx > 0
-            SelectPanelWindowByIndex(keepIdx, false, false)
-        else if !SearchHasFocus()
-            SelectPanelWindowByIndex(1, false, false)
-    } else
-        g_SelectedHwnd := 0
+    if restoreHiddenSelection && ExpandSectionForSelectedHwnd(plan)
+        BuildRowModelFromPlan(plan)
     if g_Gui && g_MidPane
         LayoutPanel()
+    SyncPanelSelection(false)
 }
 
 SearchHasFocus() {
@@ -1077,6 +1064,54 @@ VisibleWindowRows() {
         out.Push({ sec: r.sec, row: r.row, hwnd: r.hwnd })
     }
     return out
+}
+
+; If g_SelectedHwnd sits in a collapsed section on panel reopen, expand so restore can find it.
+ExpandSectionForSelectedHwnd(plan) {
+    global g_SelectedHwnd, g_Filter, g_Sections
+    if g_Filter != "" || !g_SelectedHwnd
+        return false
+    try {
+        if !WinExist("ahk_id " g_SelectedHwnd)
+            return false
+    } catch
+        return false
+    for r in VisibleWindowRows()
+        if Integer(r.hwnd) = Integer(g_SelectedHwnd)
+            return false
+    sec := SectionIndexOf(g_SelectedHwnd)
+    if sec < 1 || sec > g_Sections.Length
+        return false
+    if g_Sections[sec].expanded
+        return false
+    secOrd := plan.Has(sec) ? plan[sec] : []
+    if !HwndInArr(secOrd, g_SelectedHwnd)
+        return false
+    g_Sections[sec].expanded := true
+    return true
+}
+
+; Restore g_SelectedHwnd when still visible; otherwise first row. Call after LayoutPanel (scroll needs row rects).
+SyncPanelSelection(focusList := false) {
+    global g_SelectedHwnd
+    rows := VisibleWindowRows()
+    if !rows.Length {
+        g_SelectedHwnd := 0
+        return false
+    }
+    idx := 0
+    if g_SelectedHwnd {
+        for i, r in rows
+            if Integer(r.hwnd) = Integer(g_SelectedHwnd) {
+                idx := i
+                break
+            }
+    }
+    if !idx && !SearchHasFocus()
+        idx := 1
+    if !idx
+        return false
+    return SelectPanelWindowByIndex(idx, focusList, true)
 }
 
 VisibleWindowRowModelIndices() {
@@ -2027,16 +2062,14 @@ ShowPanel(*) {
     SetTimer(PostShowLayout, -1) ; re-measure on monitors where metrics settle after first paint
     KeepPanelTopNoActivate()
     SetTimer(HoverButtonPoll, 100)
-    RefreshLists()
-    if !SelectFirstPanelWindow(true)
+    RefreshLists(wasHidden)
+    if !SyncPanelSelection(true)
         try g_Search.Focus()
 }
 
 ToggleHotkey(*) {
-    global g_PanelVisible, g_Gui
-    if !g_PanelVisible
-        ShowPanel()
-    else if g_Gui && WinActive("ahk_id " g_Gui.Hwnd)
+    global g_PanelVisible
+    if g_PanelVisible
         HidePanel()
     else
         ShowPanel()
