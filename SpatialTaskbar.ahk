@@ -236,6 +236,24 @@ ProcessPathFromPid(pid) {
     return StrGet(buf, "UTF-16")
 }
 
+; Get/SetWindowLongPtr and GetClassLongPtr are macros on 32-bit (map to *Long),
+; so user32 does not export those names from a 32-bit process — Ahk2Exe 32-bit
+; builds then fail with "Call to nonexistent function".
+WinGetLongPtr(hwnd, nIndex) {
+    return DllCall(A_PtrSize = 8 ? "user32\GetWindowLongPtrW" : "user32\GetWindowLongW"
+        , "ptr", hwnd, "int", nIndex, "ptr")
+}
+
+WinSetLongPtr(hwnd, nIndex, newLong) {
+    return DllCall(A_PtrSize = 8 ? "user32\SetWindowLongPtrW" : "user32\SetWindowLongW"
+        , "ptr", hwnd, "int", nIndex, "ptr", newLong, "ptr")
+}
+
+WinGetClassLongPtr(hwnd, nIndex) {
+    return DllCall(A_PtrSize = 8 ? "user32\GetClassLongPtrW" : "user32\GetClassLongW"
+        , "ptr", hwnd, "int", nIndex, "ptr")
+}
+
 GetWindowIconHandle(hwnd) {
     WM_GETICON := 0x007F
     for v in [2, 0, 1] { ; ICON_SMALL2, ICON_SMALL, ICON_BIG
@@ -243,10 +261,10 @@ GetWindowIconHandle(hwnd) {
         if h
             return h
     }
-    h := DllCall("user32\GetClassLongPtrW", "ptr", hwnd, "int", -34, "ptr") ; GCLP_HICONSM
+    h := WinGetClassLongPtr(hwnd, -34) ; GCLP_HICONSM
     if h
         return h
-    return DllCall("user32\GetClassLongPtrW", "ptr", hwnd, "int", -14, "ptr") ; GCLP_HICON
+    return WinGetClassLongPtr(hwnd, -14) ; GCLP_HICON
 }
 
 IconFromExePath(path) {
@@ -1995,8 +2013,8 @@ EnsureMidPane() {
     WS_VSCROLL := 0x200000
     WS_CLIPCHILDREN := 0x02000000
     WS_TABSTOP := 0x00010000
-    ws := DllCall("user32\GetWindowLongPtr", "ptr", g_MidPane.Hwnd, "int", GWL_STYLE, "ptr")
-    DllCall("user32\SetWindowLongPtr", "ptr", g_MidPane.Hwnd, "int", GWL_STYLE, "ptr", ws | WS_VSCROLL | WS_CLIPCHILDREN | WS_TABSTOP)
+    ws := WinGetLongPtr(g_MidPane.Hwnd, GWL_STYLE)
+    WinSetLongPtr(g_MidPane.Hwnd, GWL_STYLE, ws | WS_VSCROLL | WS_CLIPCHILDREN | WS_TABSTOP)
     if !g_MidPaneSubclassCb
         g_MidPaneSubclassCb := CallbackCreate(MidPaneSubclassProc, "Fast", 6)
     DllCall("Comctl32\SetWindowSubclass", "ptr", g_MidPane.Hwnd, "ptr", g_MidPaneSubclassCb, "ptr", MID_PANE_SUBCLASS_ID, "ptr", 0)
@@ -2096,8 +2114,8 @@ EnsureGui() {
     g_Gui.MarginX := 4, g_Gui.MarginY := 6
     GWL_STYLE := -16
     WS_CLIPCHILDREN := 0x02000000
-    wsMain := DllCall("user32\GetWindowLongPtr", "ptr", g_Gui.Hwnd, "int", GWL_STYLE, "ptr")
-    DllCall("user32\SetWindowLongPtr", "ptr", g_Gui.Hwnd, "int", GWL_STYLE, "ptr", wsMain | WS_CLIPCHILDREN)
+    wsMain := WinGetLongPtr(g_Gui.Hwnd, GWL_STYLE)
+    WinSetLongPtr(g_Gui.Hwnd, GWL_STYLE, wsMain | WS_CLIPCHILDREN)
     g_Gui.OnEvent("Escape", HidePanel)
     g_Gui.OnEvent("Close", HidePanel)
     g_Gui.OnEvent("Size", Gui_Size)
@@ -2119,8 +2137,8 @@ EnsureGui() {
     ; Flatten search edge to remove bright Win32 bevel.
     GWL_EXSTYLE := -20
     WS_EX_CLIENTEDGE := 0x00000200
-    exSearch := DllCall("user32\GetWindowLongPtr", "ptr", g_Search.Hwnd, "int", GWL_EXSTYLE, "ptr")
-    DllCall("user32\SetWindowLongPtr", "ptr", g_Search.Hwnd, "int", GWL_EXSTYLE, "ptr", exSearch & ~WS_EX_CLIENTEDGE)
+    exSearch := WinGetLongPtr(g_Search.Hwnd, GWL_EXSTYLE)
+    WinSetLongPtr(g_Search.Hwnd, GWL_EXSTYLE, exSearch & ~WS_EX_CLIENTEDGE)
 
     g_SearchClear := g_Gui.Add("Text", "vBtnSearchClear ys w" ui(24) " h" ui(24) " +Tabstop +0x100 +0x200 Center Border", "×")
     g_SearchClear.OnEvent("Click", SearchClearClick)
