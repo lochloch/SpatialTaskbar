@@ -41,6 +41,7 @@ InitDpiAwareness()
 ; A "×" beside the search box clears the filter (same row as Open / + Section / - Section); always visible; extra clicks when empty do nothing.
 ;
 ; No disk persistence: everything is in memory until you exit or #Reload.
+; Panel open count (#N, bottom-right) is session-only — resets when the process exits.
 ; Middle-click a row: same Z-order bump as left click, then WM_CLOSE is posted.
 ; Many Explorer windows still feel “easy” because each row is one HWND and close
 ; is usually one step. Word/Excel/etc. often show save or other modals per window;
@@ -61,6 +62,8 @@ global g_SelectedHwnd := 0
 global g_ActiveSec := 1
 global g_SelectedSection := 0 ; section index for header selection (- Section); 0 = none
 global g_PanelVisible := false
+global g_PanelOpenCount := 0 ; panel opens since this process started (in-memory odometer)
+global g_Odo := 0 ; footer Text "#N" (bottom-right); not a button / not in Tab order
 global g_SuppressFocusHide := false ; keep panel visible while activating windows from list click
 global g_Drag := 0
 global g_SkipClickUntil := 0 ; suppress click-activate right after drag release
@@ -2058,11 +2061,12 @@ HidePanel(*) {
 }
 
 ShowPanel(*) {
-    global g_Gui, g_PanelVisible, g_Search, g_SuppressFocusHide, g_ScrollY, g_LastListSig
+    global g_Gui, g_PanelVisible, g_PanelOpenCount, g_Search, g_SuppressFocusHide, g_ScrollY, g_LastListSig
     wasHidden := !g_PanelVisible
     EnsureGui()
     g_ScrollY := 0
     if wasHidden {
+        g_PanelOpenCount += 1
         SetTimer(RefreshLists, 0) ; drop pending search debounce from last open
         g_LastListSig := ""
         ResetIconList() ; avoid stale HWND/icon cache and long-session icon-list growth
@@ -2094,7 +2098,7 @@ ToggleHotkey(*) {
 }
 
 EnsureGui() {
-    global g_Gui, g_MidPane, g_Search, g_SearchClear, g_Sections, WM_VSCROLL, WM_MOUSEWHEEL, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_ACTIVATE, WM_ACTIVATEAPP, WM_DPICHANGED
+    global g_Gui, g_MidPane, g_Search, g_SearchClear, g_Odo, g_Sections, WM_VSCROLL, WM_MOUSEWHEEL, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_ACTIVATE, WM_ACTIVATEAPP, WM_DPICHANGED
     if g_Gui
         return
     if !g_Sections.Length
@@ -2154,6 +2158,11 @@ EnsureGui() {
     g_Gui.Add("Text", "vBtnDownloads ys w" ui(90) " h" ui(28) " Hidden +Tabstop +0x100 +0x200 Center Border", "Downloads").OnEvent("Click", BtnDownloads)
     g_Gui.Add("Text", "vBtnDesktop ys w" ui(110) " h" ui(28) " Hidden +Tabstop +0x100 +0x200 Center Border", "Show desktop").OnEvent("Click", BtnDesktop)
 
+    ; Session open count (bottom-right); muted status text — not a control.
+    g_Odo := g_Gui.Add("Text", "vOdoCount w" ui(56) " h" ui(28) " Right +0x200", "#0")
+    try g_Odo.Opt("+c808080")
+    try g_Odo.SetFont("s" Max(8, Round(9 * scale)), "Segoe UI")
+
     for nm in ["BtnSearchClear", "BtnOpen", "BtnAdd", "BtnDel", "BtnStart", "BtnExplorer", "BtnDownloads", "BtnDesktop"]
         ThemeStyleButton(g_Gui[nm])
     ThemeStyleCloseButton(g_Gui["BtnClosePanel"])
@@ -2211,7 +2220,7 @@ RebuildPanel() {
 }
 
 LayoutPanel() {
-    global g_Gui, g_MidPane, g_Search, g_SearchClear, g_Sections, g_ScrollY, g_ScrollContentH, g_ScrollViewportH
+    global g_Gui, g_MidPane, g_Search, g_SearchClear, g_Odo, g_PanelOpenCount, g_Sections, g_ScrollY, g_ScrollContentH, g_ScrollViewportH
     global g_SectionHeaderClientRects, g_WindowRowClientRects, g_SectionListBands, LV_ROW_HEIGHT, MID_PANE_HDR_H, MID_PANE_CHEV_W
     if !g_Gui || !g_MidPane
         return
@@ -2359,6 +2368,12 @@ LayoutPanel() {
         b.GetPos(, , &bw, &bh)
         b.Move(xb, btnY, bw, bh)
         xb += bw + 6
+    }
+
+    if g_Odo {
+        odoW := Px(56)
+        try g_Odo.Text := "#" g_PanelOpenCount
+        g_Odo.Move(gw - marginX - odoW, btnY, odoW, botRowH)
     }
 }
 
