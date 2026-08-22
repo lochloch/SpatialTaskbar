@@ -52,6 +52,9 @@ no installer, no settings file, nothing written to disk.
   name to select it). *Uncategorized* cannot be removed.
 - Click the chevron, or click the section name twice within ~400 ms, to
   expand / collapse.
+- Click the pencil on the right of a section header to rename it in place.
+  Enter or clicking elsewhere commits; Esc cancels. *Uncategorized* cannot
+  be renamed.
 
 ## Search
 

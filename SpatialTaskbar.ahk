@@ -30,6 +30,8 @@ InitDpiAwareness()
 ; Section header: click the name to select that section (highlight). Click the
 ; chevron (or two quick clicks on the same name within ~400 ms) to expand/collapse
 ; (chevron / double-name toggle is ignored while a text filter is active — sections stay expanded).
+; Click the pencil on the right of a header to rename in place (Enter / click-away
+; commits, Esc cancels). Uncategorized has no pencil and cannot be renamed.
 ; - Section removes only the currently selected section (never Uncategorized). Drag onto a section name/chevron
 ; moves the window into that section (works while the section is collapsed too).
 ;
@@ -77,6 +79,10 @@ global g_WindowRowIndexByHwnd := Map() ; hwnd -> row index in g_RowModel
 global g_RowModelIndexBySecRow := Map() ; "sec:row" -> row index in g_RowModel
 global g_RowHwndsBySection := Map() ; sec idx -> [hwnd,...] in current visible row-model order
 global g_MidClickRow := 0 ; pending row click / drag threshold {sec,row,hwnd,mx,my}
+global g_RenameEdit := 0 ; mid-pane child Edit overlay for in-place section rename
+global g_RenameSec := 0 ; section index being renamed; 0 = none
+global g_RenameOrig := "" ; name to restore on Esc / empty commit
+global g_RenameBusy := false ; reentrancy guard (LoseFocus vs commit/cancel)
 global g_SectionHeaderClientRects := Map() ; sec idx -> {l,t,r,b} in mid-pane client coords
 global g_WindowRowClientRects := [] ; [{sec,row,hwnd,l,t,r,b}, ...] in mid-pane client coords
 global g_SectionListBands := Map() ; sec idx -> {l,t,r,b,rows} in mid-pane client coords
@@ -119,6 +125,7 @@ global FONT_LV_PT := Round(10 * 1.3)        ; 13
 global LV_ROW_HEIGHT := Round(22 * 1.3)   ; was 22 px/row at smaller text
 global MID_PANE_HDR_H := 30
 global MID_PANE_CHEV_W := 28
+global MID_PANE_PENCIL_W := 22
 
 ; Middle-click close: ask before WM_CLOSE for apps that usually prompt (add/remove exe names).
 global g_CloseConfirmExes := Map(
@@ -1301,6 +1308,10 @@ PanelEnter(*) {
     global g_Gui, g_SelectedHwnd, g_Search, g_MidPane
     if !g_Gui
         return
+    if SectionRenameActive() {
+        CommitSectionRename()
+        return
+    }
     fh := DllCall("user32\GetFocus", "ptr")
     if !fh
         return
@@ -1396,8 +1407,14 @@ MidPaneLButtonDown(wParam, lParam, msg, hwnd, *) {
         cx -= 65536
     if cy > 32767
         cy -= 65536
-    sec := 0, inChev := false
-    if MidPaneHitTestSectionHeader(cx, cy, &sec, &inChev) {
+    sec := 0, inChev := false, inPencil := false
+    if MidPaneHitTestSectionHeader(cx, cy, &sec, &inChev, &inPencil) {
+        if inPencil {
+            hdrDblSec := 0, hdrDblTick := 0
+            SecHdrSelect(sec)
+            StartSectionRename(sec)
+            return
+        }
         if inChev {
             hdrDblSec := 0, hdrDblTick := 0
             ToggleExpand(sec)
@@ -1663,8 +1680,8 @@ MidPaneRefreshPaint() {
 }
 
 PaintMidPaneClient(hdc, hwnd) {
-    global g_RowModel, g_Sections, g_SectionHeaderClientRects, g_WindowRowClientRects, g_SelectedHwnd, g_SelectedSection, g_IconList
-    global THEME_PANEL, THEME_HDR, THEME_SEL, THEME_TEXT, ICON_SIZE, LV_ROW_HEIGHT, THEME_LV_BG, THEME_LV_TEXT, MID_PANE_CHEV_W
+    global g_RowModel, g_Sections, g_SectionHeaderClientRects, g_WindowRowClientRects, g_SelectedHwnd, g_SelectedSection, g_IconList, g_RenameSec
+    global THEME_PANEL, THEME_HDR, THEME_SEL, THEME_TEXT, ICON_SIZE, LV_ROW_HEIGHT, THEME_LV_BG, THEME_LV_TEXT, MID_PANE_CHEV_W, MID_PANE_PENCIL_W
     static brPanel := 0, brHdr := 0, brSel := 0, brLv := 0
     static panelRgb := "", hdrRgb := "", selRgbRef := "", lvRgb := ""
     rc := Buffer(16, 0)
@@ -1701,7 +1718,7 @@ PaintMidPaneClient(hdc, hwnd) {
     DllCall("user32\FillRect", "ptr", hdc, "ptr", rc, "ptr", brPanel)
     DllCall("gdi32\SetBkMode", "ptr", hdc, "int", 1) ; TRANSPARENT
     txtRgb := ColorRefFromRgb(Integer("0x" THEME_TEXT))
-    DT_LEFT := 0x0, DT_VCENTER := 0x4, DT_SINGLELINE := 0x20, DT_END_ELLIPSIS := 0x8000
+    DT_LEFT := 0x0, DT_CENTER := 0x1, DT_VCENTER := 0x4, DT_SINGLELINE := 0x20, DT_END_ELLIPSIS := 0x8000
     for i, s in g_Sections {
         if !g_SectionHeaderClientRects.Has(i)
             continue
@@ -1709,6 +1726,7 @@ PaintMidPaneClient(hdc, hwnd) {
         if hr.b < 0 || hr.t > cliH
             continue
         sel := (i = g_SelectedSection)
+        canRename := !s.locked
         rrFill := Buffer(16, 0)
         NumPut("int", hr.l, rrFill, 0)
         NumPut("int", hr.t, rrFill, 4)
@@ -1724,13 +1742,23 @@ PaintMidPaneClient(hdc, hwnd) {
         NumPut("int", hr.b, trChev, 12)
         oldF := DllCall("gdi32\SelectObject", "ptr", hdc, "ptr", MidPaneUiFont(hwnd), "ptr")
         DllCall("user32\DrawTextW", "ptr", hdc, "str", chev, "int", -1, "ptr", trChev, "uint", DT_LEFT | DT_VCENTER | DT_SINGLELINE)
-        trNm := Buffer(16, 0)
-        NumPut("int", hr.l + MID_PANE_CHEV_W + 4, trNm, 0)
-        NumPut("int", hr.t, trNm, 4)
-        NumPut("int", hr.r - 4, trNm, 8)
-        NumPut("int", hr.b, trNm, 12)
-        DllCall("gdi32\SelectObject", "ptr", hdc, "ptr", MidPaneHdrBoldFont(hwnd), "ptr")
-        DllCall("user32\DrawTextW", "ptr", hdc, "str", s.name, "int", -1, "ptr", trNm, "uint", DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS)
+        if canRename {
+            trPen := Buffer(16, 0)
+            NumPut("int", hr.r - MID_PANE_PENCIL_W + 1, trPen, 0)
+            NumPut("int", hr.t, trPen, 4)
+            NumPut("int", hr.r - 1, trPen, 8)
+            NumPut("int", hr.b, trPen, 12)
+            DllCall("user32\DrawTextW", "ptr", hdc, "str", "✎", "int", -1, "ptr", trPen, "uint", DT_CENTER | DT_VCENTER | DT_SINGLELINE)
+        }
+        if i != g_RenameSec {
+            trNm := Buffer(16, 0)
+            NumPut("int", hr.l + MID_PANE_CHEV_W + 4, trNm, 0)
+            NumPut("int", hr.t, trNm, 4)
+            NumPut("int", (canRename ? hr.r - MID_PANE_PENCIL_W : hr.r) - 4, trNm, 8)
+            NumPut("int", hr.b, trNm, 12)
+            DllCall("gdi32\SelectObject", "ptr", hdc, "ptr", MidPaneHdrBoldFont(hwnd), "ptr")
+            DllCall("user32\DrawTextW", "ptr", hdc, "str", s.name, "int", -1, "ptr", trNm, "uint", DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS)
+        }
         DllCall("gdi32\SelectObject", "ptr", hdc, "ptr", oldF, "ptr")
     }
     DllCall("gdi32\SetTextColor", "ptr", hdc, "uint", ColorRefFromRgb(THEME_LV_TEXT))
@@ -1777,15 +1805,18 @@ MidPaneSubclassProc(hWnd, uMsg, wParam, lParam, uIdSubclass, dwRefData) {
     return DllCall("Comctl32\DefSubclassProc", "ptr", hWnd, "uint", uMsg, "ptr", wParam, "ptr", lParam, "ptr")
 }
 
-MidPaneHitTestSectionHeader(cx, cy, &secIdx, &inChevron) {
-    global g_SectionHeaderClientRects, MID_PANE_CHEV_W
+MidPaneHitTestSectionHeader(cx, cy, &secIdx, &inChevron, &inPencil) {
+    global g_SectionHeaderClientRects, g_Sections, MID_PANE_CHEV_W, MID_PANE_PENCIL_W
     secIdx := 0
     inChevron := false
+    inPencil := false
     for i, hr in g_SectionHeaderClientRects {
         if cx < hr.l || cx > hr.r || cy < hr.t || cy > hr.b
             continue
         secIdx := i
         inChevron := (cx < hr.l + MID_PANE_CHEV_W)
+        if !inChevron && i <= g_Sections.Length && !g_Sections[i].locked && (cx > hr.r - MID_PANE_PENCIL_W)
+            inPencil := true
         return true
     }
     return false
@@ -1973,6 +2004,165 @@ ToggleExpand(secIdx, *) {
     RefreshLists()
 }
 
+SectionCanRename(secIdx) {
+    global g_Sections
+    if secIdx < 1 || secIdx > g_Sections.Length
+        return false
+    return !g_Sections[secIdx].locked
+}
+
+SectionRenameActive() {
+    global g_RenameSec
+    return g_RenameSec > 0
+}
+
+SectionRenameEditRect(hr) {
+    global MID_PANE_CHEV_W, MID_PANE_PENCIL_W
+    x := hr.l + MID_PANE_CHEV_W + 2
+    y := hr.t + 3
+    r := hr.r - MID_PANE_PENCIL_W - 1
+    b := hr.b - 3
+    return { x: x, y: y, w: Max(20, r - x), h: Max(16, b - y) }
+}
+
+ApplySectionRenameEditFont() {
+    global g_RenameEdit, g_MidPane
+    if !g_RenameEdit || !g_MidPane
+        return
+    try DllCall("user32\SendMessage", "ptr", g_RenameEdit.Hwnd, "uint", 0x0030, "ptr", MidPaneHdrBoldFont(g_MidPane.Hwnd), "ptr", 1)
+}
+
+HideSectionRenameEdit() {
+    global g_RenameEdit
+    if !g_RenameEdit
+        return
+    try g_RenameEdit.Visible := false
+}
+
+StartSectionRename(secIdx) {
+    global g_RenameBusy, g_RenameSec, g_RenameOrig, g_RenameEdit, g_Sections, g_MidPane, g_SectionHeaderClientRects
+    if g_RenameBusy
+        return
+    if !SectionCanRename(secIdx)
+        return
+    if !g_RenameEdit || !g_MidPane
+        return
+    if !g_SectionHeaderClientRects.Has(secIdx)
+        return
+    if g_RenameSec = secIdx
+        return
+    if g_RenameSec
+        CommitSectionRename()
+    g_RenameBusy := true
+    try {
+        g_RenameSec := secIdx
+        g_RenameOrig := g_Sections[secIdx].name
+        hr := g_SectionHeaderClientRects[secIdx]
+        rc := SectionRenameEditRect(hr)
+        g_RenameEdit.Value := g_RenameOrig
+        g_RenameEdit.Move(rc.x, rc.y, rc.w, rc.h)
+        ApplySectionRenameEditFont()
+        g_RenameEdit.Visible := true
+        g_RenameEdit.Focus()
+        DllCall("user32\SendMessage", "ptr", g_RenameEdit.Hwnd, "uint", 0x00B1, "ptr", 0, "ptr", -1) ; EM_SETSEL all
+        MidPaneInvalidate()
+    } finally {
+        g_RenameBusy := false
+    }
+}
+
+CommitSectionRename(*) {
+    global g_RenameBusy, g_RenameSec, g_RenameOrig, g_RenameEdit, g_Sections, g_RowModel
+    if g_RenameBusy || !g_RenameSec
+        return
+    g_RenameBusy := true
+    try {
+        sec := g_RenameSec
+        newName := ""
+        try newName := g_RenameEdit ? Trim(g_RenameEdit.Value) : ""
+        if newName = ""
+            newName := g_RenameOrig
+        if SectionCanRename(sec)
+            g_Sections[sec].name := newName
+        for r in g_RowModel {
+            if r.type = "section" && r.sec = sec
+                r.name := newName
+        }
+        g_RenameSec := 0
+        g_RenameOrig := ""
+        stillOnEdit := false
+        try {
+            fh := DllCall("user32\GetFocus", "ptr")
+            stillOnEdit := g_RenameEdit && fh && Integer(fh) = Integer(g_RenameEdit.Hwnd)
+        }
+        HideSectionRenameEdit()
+        MidPaneInvalidate()
+        if stillOnEdit
+            FocusMidPaneRows()
+    } finally {
+        g_RenameBusy := false
+    }
+}
+
+CancelSectionRename(*) {
+    global g_RenameBusy, g_RenameSec, g_RenameOrig, g_RenameEdit
+    if g_RenameBusy || !g_RenameSec
+        return
+    g_RenameBusy := true
+    try {
+        g_RenameSec := 0
+        g_RenameOrig := ""
+        stillOnEdit := false
+        try {
+            fh := DllCall("user32\GetFocus", "ptr")
+            stillOnEdit := g_RenameEdit && fh && Integer(fh) = Integer(g_RenameEdit.Hwnd)
+        }
+        HideSectionRenameEdit()
+        MidPaneInvalidate()
+        if stillOnEdit
+            FocusMidPaneRows()
+    } finally {
+        g_RenameBusy := false
+    }
+}
+
+SectionRenameLoseFocus(*) {
+    global g_RenameBusy
+    if g_RenameBusy
+        return
+    CommitSectionRename()
+}
+
+SyncSectionRenameEditPos() {
+    global g_RenameSec, g_RenameEdit, g_MidPane, g_SectionHeaderClientRects, g_Sections
+    if !g_RenameSec || !g_RenameEdit || !g_MidPane
+        return
+    if !g_SectionHeaderClientRects.Has(g_RenameSec) || g_RenameSec > g_Sections.Length {
+        CancelSectionRename()
+        return
+    }
+    hr := g_SectionHeaderClientRects[g_RenameSec]
+    rc := SectionRenameEditRect(hr)
+    try {
+        g_RenameEdit.Move(rc.x, rc.y, rc.w, rc.h)
+        ApplySectionRenameEditFont()
+    }
+}
+
+PanelEscape(*) {
+    ; Gui Escape + Esc hotkey can both fire for one key; HidePanel is idempotent,
+    ; but cancel-then-hide would dismiss the panel after a rename Esc.
+    static lastTick := 0
+    if (A_TickCount - lastTick) < 80
+        return
+    lastTick := A_TickCount
+    if SectionRenameActive() {
+        CancelSectionRename()
+        return
+    }
+    HidePanel()
+}
+
 ; Hide panel first so a Run / Send failure (AppLocker, GPO, missing shell verb, blocked
 ; SendInput) can never leave the panel stuck on screen. Action calls are wrapped in try
 ; for the same reason — locked-down corporate machines often refuse these silently or
@@ -1999,9 +2189,12 @@ BtnDesktop(*) {
 }
 
 EnsureMidPane() {
-    global g_Gui, g_MidPane, THEME_PANEL, g_MidPaneSubclassCb, MID_PANE_SUBCLASS_ID
+    global g_Gui, g_MidPane, THEME_PANEL, THEME_TEXT, g_MidPaneSubclassCb, MID_PANE_SUBCLASS_ID, g_RenameEdit, g_RenameSec, g_RenameOrig
     if !g_Gui
         return
+    g_RenameEdit := 0
+    g_RenameSec := 0
+    g_RenameOrig := ""
     if g_MidPane {
         if g_MidPaneSubclassCb
             try DllCall("Comctl32\RemoveWindowSubclass", "ptr", g_MidPane.Hwnd, "ptr", g_MidPaneSubclassCb, "ptr", MID_PANE_SUBCLASS_ID)
@@ -2021,12 +2214,25 @@ EnsureMidPane() {
     if !g_MidPaneSubclassCb
         g_MidPaneSubclassCb := CallbackCreate(MidPaneSubclassProc, "Fast", 6)
     DllCall("Comctl32\SetWindowSubclass", "ptr", g_MidPane.Hwnd, "ptr", g_MidPaneSubclassCb, "ptr", MID_PANE_SUBCLASS_ID, "ptr", 0)
+
+    g_RenameEdit := g_MidPane.Add("Edit", "vSectionRenameEdit x0 y0 w40 h20 Hidden +0x80", "")
+    try g_RenameEdit.Opt("-Theme +Background" THEME_PANEL " +c" THEME_TEXT)
+    GWL_EXSTYLE := -20
+    WS_EX_CLIENTEDGE := 0x00000200
+    try {
+        exRen := WinGetLongPtr(g_RenameEdit.Hwnd, GWL_EXSTYLE)
+        WinSetLongPtr(g_RenameEdit.Hwnd, GWL_EXSTYLE, exRen & ~WS_EX_CLIENTEDGE)
+    }
+    g_RenameEdit.OnEvent("LoseFocus", SectionRenameLoseFocus)
 }
 
 DestroySectionGuiChildren() {
-    global g_Sections, g_MidPane, g_MidPaneSubclassCb, MID_PANE_SUBCLASS_ID
+    global g_Sections, g_MidPane, g_MidPaneSubclassCb, MID_PANE_SUBCLASS_ID, g_RenameEdit, g_RenameSec, g_RenameOrig
     for s in g_Sections
         s.lv := 0, s.hdrChev := 0, s.hdrName := 0, s.btnUp := 0, s.btnDn := 0
+    g_RenameEdit := 0
+    g_RenameSec := 0
+    g_RenameOrig := ""
     if g_MidPane {
         if g_MidPaneSubclassCb
             try DllCall("Comctl32\RemoveWindowSubclass", "ptr", g_MidPane.Hwnd, "ptr", g_MidPaneSubclassCb, "ptr", MID_PANE_SUBCLASS_ID)
@@ -2037,6 +2243,7 @@ DestroySectionGuiChildren() {
 
 HidePanel(*) {
     global g_Gui, g_PanelVisible, g_Drag, g_MidClickRow, g_SuppressFocusHide, g_ScrollY
+    CommitSectionRename()
     SetTimer(HoverButtonPoll, 0)
     ClearButtonHoverHighlight()
     ClearButtonFocusHighlight()
@@ -2120,7 +2327,7 @@ EnsureGui() {
     WS_CLIPCHILDREN := 0x02000000
     wsMain := WinGetLongPtr(g_Gui.Hwnd, GWL_STYLE)
     WinSetLongPtr(g_Gui.Hwnd, GWL_STYLE, wsMain | WS_CLIPCHILDREN)
-    g_Gui.OnEvent("Escape", HidePanel)
+    g_Gui.OnEvent("Escape", PanelEscape)
     g_Gui.OnEvent("Close", HidePanel)
     g_Gui.OnEvent("Size", Gui_Size)
     OnMessage(WM_LBUTTONUP, DragPanelLButtonUp)
@@ -2197,6 +2404,7 @@ RebuildPanel() {
     global g_Gui, g_MidPane, g_Sections, g_LastListSig, g_RebuildingGui, g_PanelVisible
     if !g_Gui
         return
+    CommitSectionRename()
     g_RebuildingGui := true
     try {
         DestroySectionGuiChildren()
@@ -2360,6 +2568,7 @@ LayoutPanel() {
         DllCall("user32\LockWindowUpdate", "ptr", 0)
     }
     MidPaneRefreshPaint()
+    SyncSectionRenameEditPos()
 
     btnY := gh - footerPadBottom - botRowH
     xb := marginX
@@ -2402,7 +2611,11 @@ Cleanup(*) {
 #HotIf MButtonOverPanelRows()
 MButton:: MidPaneMiddleClickClose()
 
-#HotIf g_PanelVisible
+#HotIf g_PanelVisible && SectionRenameActive()
+Enter:: CommitSectionRename()
+Esc:: PanelEscape()
+
+#HotIf g_PanelVisible && !SectionRenameActive()
 Up:: MovePanelSelection(-1)
 Down:: MovePanelSelection(1)
 PgUp:: MovePanelSelectionByPage(-1)
@@ -2413,7 +2626,7 @@ Tab:: FocusCycle(1)
 +Tab:: FocusCycle(-1)
 Enter:: PanelEnter()
 Delete:: CloseSelectedPanelWindow()
-Esc:: HidePanel()
+Esc:: PanelEscape()
 
 #HotIf g_PanelVisible
 ~LButton:: PanelOutsideClickClose()
