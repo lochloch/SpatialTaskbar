@@ -101,6 +101,7 @@ global WM_DPICHANGED := 0x02E0
 global VK_LBUTTON := 0x01
 
 global g_IconList := 0
+global g_IconListSize := 0 ; pixel size g_IconList was created for (rebuild when DPI changes)
 global g_HwndIconIdx := Map() ; hwnd -> small-icon index in g_IconList
 
 ; VS Code / Cursor–style dark UI (approx. Dark+ / default dark theme)
@@ -118,14 +119,21 @@ global g_HoverBtnName := "" ; v-name of Text button under cursor (hover polish)
 global g_FocusBtnName := "" ; v-name of Text button with keyboard focus (focus ring polish)
 global THEME_LV_BG := 0x252526
 global THEME_LV_TEXT := 0xCCCCCC
-global ICON_SIZE := 24 ; 50% bigger than 16px
-
-; Custom list row text: ~30% larger than main UI (s10 → s13); row pitch matches so text is not clipped.
-global FONT_LV_PT := Round(10 * 1.3)        ; 13
-global LV_ROW_HEIGHT := Round(22 * 1.3)   ; was 22 px/row at smaller text
+; Layout metrics at 96 DPI — UpdateLayoutMetrics() scales these to the current monitor DPI.
+global ICON_SIZE := 24
+global LV_ROW_HEIGHT := 29   ; Round(22 * 1.3) at 96 DPI
 global MID_PANE_HDR_H := 30
 global MID_PANE_CHEV_W := 28
 global MID_PANE_PENCIL_W := 22
+global TOOLBAR_FONT_PT := 10 ; logical points — Windows scales to monitor DPI; never multiply by scale
+global ODO_FONT_PT := 9
+global g_PanelScale := 1.0   ; cached PanelDpiScale for the current layout pass
+global g_PanelDpi := 0       ; last hwnd DPI UpdateLayoutMetrics saw (font/metric invalidation)
+global g_ToolbarRowH := 28   ; toolbar button row height in physical px (from font metrics)
+global g_UiPadSm := 4        ; small padding in physical px (scaled each layout)
+global g_UiPadMd := 6        ; medium padding in physical px (scaled each layout)
+global g_MidPaneUiFont := 0, g_MidPaneUiFontDpi := 0
+global g_MidPaneHdrFont := 0, g_MidPaneHdrFontDpi := 0
 
 ; Middle-click close: ask before WM_CLOSE for apps that usually prompt (add/remove exe names).
 global g_CloseConfirmExes := Map(
@@ -203,10 +211,16 @@ CloneArr(arr) {
 
 ; --- Shared small icons (image list for custom row paint + Win32 icon cache) ---
 EnsureIconList() {
-    global g_IconList, ICON_SIZE
-    if !g_IconList
-        g_IconList := DllCall("Comctl32\ImageList_Create", "int", ICON_SIZE, "int", ICON_SIZE, "uint", 0x21
-            , "int", 16, "int", 128, "ptr")
+    global g_IconList, ICON_SIZE, g_IconListSize
+    if g_IconList && g_IconListSize = ICON_SIZE
+        return
+    if g_IconList {
+        try DllCall("Comctl32\ImageList_Destroy", "ptr", g_IconList)
+        g_IconList := 0
+    }
+    g_IconList := DllCall("Comctl32\ImageList_Create", "int", ICON_SIZE, "int", ICON_SIZE, "uint", 0x21
+        , "int", 16, "int", 128, "ptr")
+    g_IconListSize := ICON_SIZE
 }
 
 ResetIconList() {
@@ -525,30 +539,28 @@ MonitorHandleFromIndex(monIdx) {
     return DllCall("User32\MonitorFromPoint", "int64", NumGet(pt, 0, "int64"), "uint", 2, "ptr")
 }
 
-MonitorDpiScale(monIdx) {
-    hMon := MonitorHandleFromIndex(monIdx)
-    if hMon {
-        dpiX := 0, dpiY := 0
-        if DllCall("GetModuleHandle", "str", "Shcore", "ptr") || DllCall("LoadLibrary", "str", "Shcore", "ptr") {
-            hr := DllCall("Shcore\GetDpiForMonitor", "ptr", hMon, "int", 0, "uint*", &dpiX, "uint*", &dpiY, "uint")
-            if hr = 0 && dpiX > 0
-                return dpiX / 96.0
-        }
-    }
-    try {
-        dpi := DllCall("User32\GetDpiForSystem", "uint")
-        if dpi > 0
-            return dpi / 96.0
-    }
-    return A_ScreenDPI ? A_ScreenDPI / 96.0 : 1.0
-}
+MonitorDpiScale(monIdx) => PanelDpiScale(0, monIdx)
 
-GuiDpiScale(hwnd) {
+GuiDpiScale(hwnd) => PanelDpiScale(hwnd)
+
+; Single DPI source for layout, fonts, and panel width — avoids monitor-vs-window mismatch.
+PanelDpiScale(hwnd := 0, monIdx := 0) {
     if hwnd {
         try {
             dpi := DllCall("User32\GetDpiForWindow", "ptr", hwnd, "uint")
             if dpi > 0
                 return dpi / 96.0
+        }
+    }
+    if monIdx {
+        hMon := MonitorHandleFromIndex(monIdx)
+        if hMon {
+            dpiX := 0, dpiY := 0
+            if DllCall("GetModuleHandle", "str", "Shcore", "ptr") || DllCall("LoadLibrary", "str", "Shcore", "ptr") {
+                hr := DllCall("Shcore\GetDpiForMonitor", "ptr", hMon, "int", 0, "uint*", &dpiX, "uint*", &dpiY, "uint")
+                if hr = 0 && dpiX > 0
+                    return dpiX / 96.0
+            }
         }
     }
     try {
@@ -560,6 +572,85 @@ GuiDpiScale(hwnd) {
 }
 
 ScalePx(n, scale) => Max(1, Round(n * scale))
+
+InvalidateMidPaneFonts() {
+    global g_MidPaneUiFont, g_MidPaneUiFontDpi, g_MidPaneHdrFont, g_MidPaneHdrFontDpi
+    if g_MidPaneUiFont {
+        DllCall("gdi32\DeleteObject", "ptr", g_MidPaneUiFont)
+        g_MidPaneUiFont := 0, g_MidPaneUiFontDpi := 0
+    }
+    if g_MidPaneHdrFont {
+        DllCall("gdi32\DeleteObject", "ptr", g_MidPaneHdrFont)
+        g_MidPaneHdrFont := 0, g_MidPaneHdrFontDpi := 0
+    }
+}
+
+; Measured tmHeight for a logical-point Segoe UI size on hwnd's monitor (physical pixels).
+FontLineHeight(hwnd, pt, bold := false) {
+    if !hwnd
+        return Max(1, Round(pt * PanelDpiScale(hwnd) * 96 / 72))
+    hdc := DllCall("User32\GetDC", "ptr", hwnd, "ptr")
+    if !hdc
+        return Max(1, Round(pt * PanelDpiScale(hwnd) * 96 / 72))
+    hFont := CreateUiFont(bold ? 650 : 400, pt, hwnd)
+    old := DllCall("gdi32\SelectObject", "ptr", hdc, "ptr", hFont, "ptr")
+    tm := Buffer(60, 0)
+    DllCall("gdi32\GetTextMetricsW", "ptr", hdc, "ptr", tm)
+    h := NumGet(tm, 0, "int")
+    DllCall("gdi32\SelectObject", "ptr", hdc, "ptr", old, "ptr")
+    DllCall("gdi32\DeleteObject", "ptr", hFont)
+    DllCall("User32\ReleaseDC", "ptr", hwnd, "ptr", hdc)
+    return Max(1, h)
+}
+
+; Scale mid-pane + toolbar geometry from one DPI reading and measured font heights. Returns true if icon list size changed.
+UpdateLayoutMetrics(hwnd := 0) {
+    global ICON_SIZE, LV_ROW_HEIGHT, MID_PANE_HDR_H, MID_PANE_CHEV_W, MID_PANE_PENCIL_W
+    global g_IconList, g_IconListSize, g_PanelScale, g_PanelDpi, g_ToolbarRowH, g_UiPadSm, g_UiPadMd
+    global TOOLBAR_FONT_PT
+    scale := PanelDpiScale(hwnd)
+    g_PanelScale := scale
+    dpiNow := hwnd ? DllCall("User32\GetDpiForWindow", "ptr", hwnd, "uint") : Round(scale * 96)
+    if dpiNow != g_PanelDpi {
+        InvalidateMidPaneFonts()
+        g_PanelDpi := dpiNow
+    }
+    padSm := ScalePx(4, scale)
+    padMd := ScalePx(6, scale)
+    g_UiPadSm := padSm, g_UiPadMd := padMd
+    prevIcon := ICON_SIZE
+    ICON_SIZE := ScalePx(24, scale)
+    MID_PANE_CHEV_W := ScalePx(28, scale)
+    MID_PANE_PENCIL_W := ScalePx(22, scale)
+    if hwnd {
+        rowTextH := FontLineHeight(hwnd, TOOLBAR_FONT_PT, false)
+        hdrTextH := FontLineHeight(hwnd, TOOLBAR_FONT_PT, true)
+        LV_ROW_HEIGHT := Max(ICON_SIZE + padSm, rowTextH + padMd)
+        MID_PANE_HDR_H := hdrTextH + padMd
+        g_ToolbarRowH := rowTextH + padMd
+    } else {
+        LV_ROW_HEIGHT := ScalePx(29, scale)
+        MID_PANE_HDR_H := ScalePx(30, scale)
+        g_ToolbarRowH := ScalePx(28, scale)
+    }
+    if prevIcon != ICON_SIZE && g_IconList {
+        ResetIconList()
+        return true
+    }
+    return false
+}
+
+ApplyToolbarFonts() {
+    global g_Gui, g_Search, g_Odo, THEME_TEXT, TOOLBAR_FONT_PT, ODO_FONT_PT
+    if !g_Gui
+        return
+    for nm in ["BtnSearchClear", "BtnOpen", "BtnAdd", "BtnDel", "BtnClosePanel", "BtnStart", "BtnExplorer", "BtnDownloads", "BtnDesktop"]
+        try g_Gui[nm].SetFont("s" TOOLBAR_FONT_PT " c" THEME_TEXT, "Segoe UI")
+    if g_Search
+        try g_Search.SetFont("s" TOOLBAR_FONT_PT, "Segoe UI")
+    if g_Odo
+        try g_Odo.SetFont("s" ODO_FONT_PT, "Segoe UI")
+}
 
 ; Minimum client width so the top toolbar (search + buttons) never overlaps.
 PanelMinWidth(scale := 1.0) {
@@ -575,7 +666,8 @@ PositionPanelOnMonitor() {
         return
     wl := 0, wt := 0, wr := 0, wb := 0, ww := 0, wh := 0
     monIdx := MonitorWorkAreaFromMouse(&wl, &wt, &wr, &wb, &ww, &wh)
-    scale := MonitorDpiScale(monIdx)
+    ; Target-monitor DPI for width — hwnd can still report the creation monitor until after Show().
+    scale := PanelDpiScale(0, monIdx)
     pw := Min(Max(PanelMinWidth(scale), Floor(ww * 0.33)), ww)
     g_Gui.Show("x" wl " y" wt " w" pw " h" wh)
 }
@@ -594,8 +686,12 @@ PostShowLayout(*) {
     global g_PanelVisible, g_Gui
     if !g_PanelVisible || !g_Gui
         return
+    iconsResized := UpdateLayoutMetrics(g_Gui.Hwnd)
+    ApplyToolbarFonts()
     PositionPanelOnMonitor()
     LayoutPanel()
+    if iconsResized
+        RefreshLists()
     EnsureSelectedWindowVisible()
 }
 
@@ -953,8 +1049,7 @@ FontPx(pt, hwnd := 0) {
             if d > 0
                 dpi := d
         }
-    }
-    if dpi = 96 && A_ScreenDPI
+    } else if A_ScreenDPI
         dpi := A_ScreenDPI
     return -Round(pt * dpi / 72.0)
 }
@@ -963,41 +1058,36 @@ CreateUiFont(weight, pt, hwnd := 0) {
     h := DllCall("gdi32\CreateFontW"
         , "int", FontPx(pt, hwnd), "int", 0, "int", 0, "int", 0
         , "int", weight, "uint", 0, "uint", 0, "uint", 0, "uint", 0, "uint", 0, "uint", 5, "uint", 0, "uint", 0
-        , "str", "Segoe UI Variable Text", "ptr")
-    if !h
-        h := DllCall("gdi32\CreateFontW"
-            , "int", FontPx(pt, hwnd), "int", 0, "int", 0, "int", 0
-            , "int", weight, "uint", 0, "uint", 0, "uint", 0, "uint", 0, "uint", 0, "uint", 5, "uint", 0, "uint", 0
-            , "str", "Segoe UI", "ptr")
+        , "str", "Segoe UI", "ptr")
     return h
 }
 
 MidPaneUiFont(hwnd := 0) {
-    static hFont := 0, hFontDpi := 0
+    global g_MidPaneUiFont, g_MidPaneUiFontDpi, TOOLBAR_FONT_PT
     dpi := hwnd ? DllCall("User32\GetDpiForWindow", "ptr", hwnd, "uint") : 96
     if !dpi
         dpi := 96
-    if !hFont || hFontDpi != dpi {
-        if hFont
-            DllCall("gdi32\DeleteObject", "ptr", hFont)
-        hFont := CreateUiFont(400, 10.5, hwnd)
-        hFontDpi := dpi
+    if !g_MidPaneUiFont || g_MidPaneUiFontDpi != dpi {
+        if g_MidPaneUiFont
+            DllCall("gdi32\DeleteObject", "ptr", g_MidPaneUiFont)
+        g_MidPaneUiFont := CreateUiFont(400, TOOLBAR_FONT_PT, hwnd)
+        g_MidPaneUiFontDpi := dpi
     }
-    return hFont
+    return g_MidPaneUiFont
 }
 
 MidPaneHdrBoldFont(hwnd := 0) {
-    static hFont := 0, hFontDpi := 0
+    global g_MidPaneHdrFont, g_MidPaneHdrFontDpi, TOOLBAR_FONT_PT
     dpi := hwnd ? DllCall("User32\GetDpiForWindow", "ptr", hwnd, "uint") : 96
     if !dpi
         dpi := 96
-    if !hFont || hFontDpi != dpi {
-        if hFont
-            DllCall("gdi32\DeleteObject", "ptr", hFont)
-        hFont := CreateUiFont(650, 10.5, hwnd)
-        hFontDpi := dpi
+    if !g_MidPaneHdrFont || g_MidPaneHdrFontDpi != dpi {
+        if g_MidPaneHdrFont
+            DllCall("gdi32\DeleteObject", "ptr", g_MidPaneHdrFont)
+        g_MidPaneHdrFont := CreateUiFont(650, TOOLBAR_FONT_PT, hwnd)
+        g_MidPaneHdrFontDpi := dpi
     }
-    return hFont
+    return g_MidPaneHdrFont
 }
 
 MidPaneHitTestWindowRow(cx, cy, &sec, &row, &wh) {
@@ -1682,6 +1772,7 @@ MidPaneRefreshPaint() {
 PaintMidPaneClient(hdc, hwnd) {
     global g_RowModel, g_Sections, g_SectionHeaderClientRects, g_WindowRowClientRects, g_SelectedHwnd, g_SelectedSection, g_IconList, g_RenameSec
     global THEME_PANEL, THEME_HDR, THEME_SEL, THEME_TEXT, ICON_SIZE, LV_ROW_HEIGHT, THEME_LV_BG, THEME_LV_TEXT, MID_PANE_CHEV_W, MID_PANE_PENCIL_W
+    global g_UiPadSm, g_UiPadMd
     static brPanel := 0, brHdr := 0, brSel := 0, brLv := 0
     static panelRgb := "", hdrRgb := "", selRgbRef := "", lvRgb := ""
     rc := Buffer(16, 0)
@@ -1736,9 +1827,9 @@ PaintMidPaneClient(hdc, hwnd) {
         DllCall("gdi32\SetTextColor", "ptr", hdc, "uint", txtRgb)
         chev := s.expanded ? "▼" : "▶"
         trChev := Buffer(16, 0)
-        NumPut("int", hr.l + 2, trChev, 0)
+        NumPut("int", hr.l + g_UiPadSm // 2, trChev, 0)
         NumPut("int", hr.t, trChev, 4)
-        NumPut("int", hr.l + MID_PANE_CHEV_W - 2, trChev, 8)
+        NumPut("int", hr.l + MID_PANE_CHEV_W - g_UiPadSm // 2, trChev, 8)
         NumPut("int", hr.b, trChev, 12)
         oldF := DllCall("gdi32\SelectObject", "ptr", hdc, "ptr", MidPaneUiFont(hwnd), "ptr")
         DllCall("user32\DrawTextW", "ptr", hdc, "str", chev, "int", -1, "ptr", trChev, "uint", DT_LEFT | DT_VCENTER | DT_SINGLELINE)
@@ -1752,9 +1843,9 @@ PaintMidPaneClient(hdc, hwnd) {
         }
         if i != g_RenameSec {
             trNm := Buffer(16, 0)
-            NumPut("int", hr.l + MID_PANE_CHEV_W + 4, trNm, 0)
+            NumPut("int", hr.l + MID_PANE_CHEV_W + g_UiPadSm, trNm, 0)
             NumPut("int", hr.t, trNm, 4)
-            NumPut("int", (canRename ? hr.r - MID_PANE_PENCIL_W : hr.r) - 4, trNm, 8)
+            NumPut("int", (canRename ? hr.r - MID_PANE_PENCIL_W : hr.r) - g_UiPadSm, trNm, 8)
             NumPut("int", hr.b, trNm, 12)
             DllCall("gdi32\SelectObject", "ptr", hdc, "ptr", MidPaneHdrBoldFont(hwnd), "ptr")
             DllCall("user32\DrawTextW", "ptr", hdc, "str", s.name, "int", -1, "ptr", trNm, "uint", DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS)
@@ -1779,13 +1870,13 @@ PaintMidPaneClient(hdc, hwnd) {
             if ih < 0
                 ih := 0
             iy := rr.t + (LV_ROW_HEIGHT - ICON_SIZE) // 2
-            DllCall("Comctl32\ImageList_Draw", "ptr", g_IconList, "int", ih, "ptr", hdc, "int", 4, "int", iy, "uint", 1) ; ILD_TRANSPARENT
+            DllCall("Comctl32\ImageList_Draw", "ptr", g_IconList, "int", ih, "ptr", hdc, "int", g_UiPadSm, "int", iy, "uint", 1) ; ILD_TRANSPARENT
         }
         title := modelIdx > 0 && HasProp(g_RowModel[modelIdx], "title") ? g_RowModel[modelIdx].title : WinRowTitle(rr.hwnd)
         tr := Buffer(16, 0)
-        NumPut("int", 8 + ICON_SIZE, tr, 0)
+        NumPut("int", g_UiPadSm + ICON_SIZE + g_UiPadSm, tr, 0)
         NumPut("int", rr.t + 1, tr, 4)
-        NumPut("int", rr.r - 4, tr, 8)
+        NumPut("int", rr.r - g_UiPadSm, tr, 8)
         NumPut("int", rr.b - 1, tr, 12)
         DllCall("user32\DrawTextW", "ptr", hdc, "str", title, "int", -1, "ptr", tr, "uint", DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS)
     }
@@ -2017,11 +2108,11 @@ SectionRenameActive() {
 }
 
 SectionRenameEditRect(hr) {
-    global MID_PANE_CHEV_W, MID_PANE_PENCIL_W
-    x := hr.l + MID_PANE_CHEV_W + 2
-    y := hr.t + 3
+    global MID_PANE_CHEV_W, MID_PANE_PENCIL_W, g_UiPadSm, g_UiPadMd
+    x := hr.l + MID_PANE_CHEV_W + g_UiPadSm // 2
+    y := hr.t + g_UiPadSm // 2
     r := hr.r - MID_PANE_PENCIL_W - 1
-    b := hr.b - 3
+    b := hr.b - g_UiPadSm // 2
     return { x: x, y: y, w: Max(20, r - x), h: Max(16, b - y) }
 }
 
@@ -2311,18 +2402,19 @@ EnsureGui() {
     if !g_Sections.Length
         InitSections()
     try DllCall("user32\SetThreadDpiAwarenessContext", "ptr", -4, "ptr")
-    scale := GuiDpiScale(0)
+    scale := PanelDpiScale(0)
     ui := (n) => ScalePx(n, scale)
-    fontPt := Max(8, Round(10 * scale))
+    global TOOLBAR_FONT_PT, ODO_FONT_PT
     ; Tool window keeps this as a lightweight panel (no taskbar button / usually not Alt+Tab).
     ; -DPIScale: use physical pixels so Show() matches MonitorGetWorkArea (critical at 125% scaling).
+    ; Toolbar fonts stay at fixed logical points — multiplying by scale double-scales at 150%+ DPI.
     ; -Border: no non-client chrome — client area equals visible panel (no taskbar gap).
     g_Gui := Gui("+AlwaysOnTop +ToolWindow -Caption -Border -E0x40000", "SpatialTaskbar")
     g_Gui.Opt("-DPIScale")
     global THEME_BG, THEME_TEXT, THEME_PANEL
     g_Gui.BackColor := THEME_BG
-    g_Gui.SetFont("s" fontPt " c" THEME_TEXT, "Segoe UI")
-    g_Gui.MarginX := 4, g_Gui.MarginY := 6
+    g_Gui.SetFont("s" TOOLBAR_FONT_PT " c" THEME_TEXT, "Segoe UI")
+    g_Gui.MarginX := 0, g_Gui.MarginY := 0
     GWL_STYLE := -16
     WS_CLIPCHILDREN := 0x02000000
     wsMain := WinGetLongPtr(g_Gui.Hwnd, GWL_STYLE)
@@ -2344,7 +2436,7 @@ EnsureGui() {
     g_Search := g_Gui.Add("Edit", "vSearchEdit xm w" ui(100) " r1", "")
     g_Search.OnEvent("Change", SearchChanged)
     try g_Search.Opt("-Theme +Background" THEME_PANEL " +c" THEME_TEXT)
-    try g_Search.SetFont("s" fontPt, "Segoe UI")
+    try g_Search.SetFont("s" TOOLBAR_FONT_PT, "Segoe UI")
     ; Flatten search edge to remove bright Win32 bevel.
     GWL_EXSTYLE := -20
     WS_EX_CLIENTEDGE := 0x00000200
@@ -2368,7 +2460,7 @@ EnsureGui() {
     ; Session open count (bottom-right); muted status text — not a control.
     g_Odo := g_Gui.Add("Text", "vOdoCount w" ui(56) " h" ui(28) " Right +0x200", "#0")
     try g_Odo.Opt("+c808080")
-    try g_Odo.SetFont("s" Max(8, Round(9 * scale)), "Segoe UI")
+    try g_Odo.SetFont("s" ODO_FONT_PT, "Segoe UI")
 
     for nm in ["BtnSearchClear", "BtnOpen", "BtnAdd", "BtnDel", "BtnStart", "BtnExplorer", "BtnDownloads", "BtnDesktop"]
         ThemeStyleButton(g_Gui[nm])
@@ -2436,7 +2528,8 @@ LayoutPanel() {
     g_Gui.GetClientPos(, , &gw, &gh)
     if gh < 150 ; width can be 0 before first Show — still run once Show() has sized the window
         return
-    scale := GuiDpiScale(g_Gui.Hwnd)
+    UpdateLayoutMetrics(g_Gui.Hwnd)
+    scale := g_PanelScale
     Px(n) => ScalePx(n, scale)
     marginX := Px(8), marginY := Px(6)
     topGap := Px(4)
@@ -2448,15 +2541,12 @@ LayoutPanel() {
     openW := Px(58)
     addW := Px(78)
     delW := Px(78)
-    btnHTop := Px(28)
-    btnHSmall := Px(24)
+    btnHTop := g_ToolbarRowH
+    btnHSmall := Max(Px(20), btnHTop - Px(4))
 
     topRowH := btnHTop
-    try g_Search.GetPos(, , , &sh)
-    if sh > topRowH
-        topRowH := sh
 
-    botRowH := 28
+    botRowH := btnHTop
     for nm in ["BtnStart", "BtnExplorer", "BtnDownloads", "BtnDesktop"] {
         b := g_Gui[nm]
         b.GetPos(, , , &bh)
@@ -2497,16 +2587,15 @@ LayoutPanel() {
 
     ; Width from left margin to clear ×; do not force a minimum that would overlap the right-placed cluster.
     searchW := Max(1, xRight - marginX)
-    g_Search.Move(marginX, marginY, searchW)
+    g_Search.Move(marginX, marginY + Max(0, (topRowH - btnHTop) // 2), searchW, btnHTop)
 
     hdrH := MID_PANE_HDR_H
-    chevW := MID_PANE_CHEV_W
-    lvPad := 2 ; tighter list padding, cleaner blocks
+    lvPad := g_UiPadSm // 2 ; tighter list padding, cleaner blocks
     ; Per-item y-advances. These MUST match the values used by the rect-building loop below;
     ; any mismatch makes maxScroll wrong and clips items at the bottom of the viewport.
-    hdrAdvance := hdrH + 4
-    listGap := 10 ; gap after a section's row block before the next header
-    bandPad := 2  ; extra pixels added to the list-band height beyond lvPad + rows
+    hdrAdvance := hdrH + g_UiPadSm
+    listGap := ScalePx(10, scale) ; gap after a section's row block before the next header
+    bandPad := g_UiPadSm // 2  ; extra pixels added to the list-band height beyond lvPad + rows
 
     ; First pass: compute total content height using the SAME arithmetic the rect loop uses.
     contentH := 0
@@ -2576,7 +2665,7 @@ LayoutPanel() {
         b := g_Gui[nm]
         b.GetPos(, , &bw, &bh)
         b.Move(xb, btnY, bw, bh)
-        xb += bw + 6
+        xb += bw + Px(6)
     }
 
     if g_Odo {
@@ -2592,6 +2681,8 @@ OnExit(Cleanup)
 
 Cleanup(*) {
     global g_MidPane, g_MidPaneSubclassCb, MID_PANE_SUBCLASS_ID, g_IconList
+
+    InvalidateMidPaneFonts()
 
     if g_MidPane && g_MidPaneSubclassCb {
         try DllCall("Comctl32\RemoveWindowSubclass", "ptr", g_MidPane.Hwnd, "ptr", g_MidPaneSubclassCb, "ptr", MID_PANE_SUBCLASS_ID)
