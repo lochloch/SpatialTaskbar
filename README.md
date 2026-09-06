@@ -5,20 +5,31 @@ to slide a panel onto the left edge of whichever monitor your cursor is on,
 listing every open window grouped into sections you can rearrange. Pick one,
 hit Enter, and the panel closes.
 
+Built because Windows 11 removed the vertical taskbar — and with it, stable
+places for open windows. This puts them in a stack again.
+
 Written in [AutoHotkey v2](https://www.autohotkey.com/). Single-file script,
 no installer, no settings file, nothing written to disk.
+
+**Site:** [spatialtaskbar.com](https://spatialtaskbar.com)
 
 ## Requirements
 
 - Windows 10 or 11
-- AutoHotkey **v2.0+**
+- AutoHotkey **v2.0+** (only if you run the `.ahk`; the `.exe` is self-contained)
 
 ## Install / run
 
+### Option A — `.exe` (no AutoHotkey install)
+
+1. Download [`SpatialTaskbar.exe`](https://github.com/lochloch/SpatialTaskbar/releases/latest/download/SpatialTaskbar.exe) from the [latest release](https://github.com/lochloch/SpatialTaskbar/releases/latest).
+2. Run it. (Optional: put a shortcut in `shell:startup` to launch on login.)
+
+### Option B — `.ahk` script
+
 1. Install AutoHotkey v2.
-2. Download `SpatialTaskbar.ahk`.
-3. Double-click it. (Optional: drop a shortcut in
-   `shell:startup` to launch on login.)
+2. Download [`SpatialTaskbar.ahk`](https://github.com/lochloch/SpatialTaskbar/releases/latest/download/SpatialTaskbar.ahk).
+3. Double-click it. (Optional: same `shell:startup` trick.)
 
 ## Hotkeys
 
