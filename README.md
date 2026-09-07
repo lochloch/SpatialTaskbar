@@ -85,6 +85,18 @@ clicking the X in its title bar does. For programs that commonly throw up a
 Access, Outlook, OneNote), a confirmation prompt is shown first. Edit
 `g_CloseConfirmExes` near the top of the script to adjust that list.
 
+## Elevated (admin) windows
+
+Windows blocks non-elevated apps from controlling elevated ones (UIPI).
+SpatialTaskbar runs normally by default, so admin windows (Task Manager,
+elevated terminals, installers, etc.) may appear in the list but Open /
+close / focus often will not work on them.
+
+**Workaround:** run SpatialTaskbar itself as administrator (right-click →
+*Run as administrator*, or set the shortcut’s Compatibility / Advanced
+property). Then it can control elevated windows. Prefer the normal
+(non-admin) launch unless you need that.
+
 ## What it does *not* do
 
 - No disk persistence. Sections, ordering, and filters live in memory until
